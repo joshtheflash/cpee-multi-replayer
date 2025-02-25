@@ -1,0 +1,53 @@
+#!/usr/bin/ruby
+curpath = __dir__
+require 'rubygems'
+require 'optparse'
+require 'fileutils'
+
+exname = File.basename($0)
+
+def wrap(s, width=78, indent=18, extra_indent=4) #{{{
+	lines = []
+	line, s = s[0..indent-2], s[indent..-1]
+  s.split(/\n/).each do |ss|
+    ss.split(/[ \t]+/).each do |word|
+      if line.size + word.size >= width
+        lines << line
+        line = (" " * (indent + extra_indent)) + word
+      else
+        line << " " << word
+      end
+    end
+    lines << line if line
+    line = (" " * (indent-1))
+  end
+	return lines.join "\n"
+end #}}}
+
+ARGV.options { |opt|
+  opt.summary_indent = ' ' * 2
+  opt.summary_width = 15
+  opt.banner = "Usage:\n#{opt.summary_indent}#{exname} new [DIR] | view [URI] | copy [URI]\n"
+  opt.on("Options:")
+  opt.on("--help", "-h", "This text") { puts opt; exit }
+	opt.on("")
+  opt.on(wrap("new [DIR]         scaffolds a sample replayer service. Add a handler to a cpee instance to automatically handle description changes and start/stop.",78,18,0))
+  opt.parse!
+}
+if (ARGV.length != 2)
+  puts ARGV.options
+  exit
+else
+  command = ARGV[0]
+  dir = ARGV[1]
+end
+
+if command == 'new'
+  if !File.exist?(dir)
+    FileUtils.cp_r(File.join(curpath,'..','server'),dir)
+  else
+    puts 'Directory already exists.'
+  end
+else
+  puts ARGV.options
+end
