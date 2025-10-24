@@ -1,0 +1,22 @@
+# Python cache and environment files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.env
+.venv/
+venv/
+
+# SQLite databases
+*.db
+
+# Logs and profiler outputs
+logs/
+*.log
+*.prof
+
+# OS files
+.DS_Store
+Thumbs.db
+
+.xes.yaml
