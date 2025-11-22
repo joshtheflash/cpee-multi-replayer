@@ -14,6 +14,21 @@
 - SQLite (bundled with Python)
 - `pip` for managing Python packages
 
+## Installation
+
+Install the replayer from PyPI (or any compatible index) in a single step:
+
+```bash
+pip install cpee-multi-replay
+```
+
+The install exposes two convenience commands:
+
+- `cpee-db-cli` – invoke any of the utility helpers defined in `app.db.dbManager`.
+- `cpee-replay-daemon` – launch the background Uvicorn daemon defined in `run_replay_daemon.py`.
+
+Runtime data (SQLite databases and settings) live under `~/.cpee_multi_replay` by default. Override that directory with the `CPEE_REPLAY_HOME` environment variable if you prefer a custom location.
+
 ## Virtual Environment & Dependencies
 
 Set up an isolated environment (recommended) and install the project requirements:
@@ -21,7 +36,7 @@ Set up an isolated environment (recommended) and install the project requirement
 ```bash
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\Scripts\activate
-pip install -r requirements.txt
+pip install -r requirements.txt  # or `pip install -e .` for editable installs
 ```
 
 ## Loading Process Logs
@@ -59,6 +74,12 @@ Start the FastAPI service from the project root:
 
 ```bash
 uvicorn app.replay:app --reload --host 0.0.0.0 --port 8000
+```
+
+After installing the project (or from the repo directly) you can also use the helper CLI:
+
+```bash
+python server.py start  # or just `server start` after `pip install`
 ```
 
 ## Additional Notes

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cpee-multi-replay"
+version = "0.1.0"
+description = "FastAPI-based CPEE multi-log replayer with SQLite-backed storage."
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{ name = "joshtheflash" }]
+keywords = ["cpee", "replay", "fastapi", "process-mining"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Operating System :: OS Independent",
+    "Topic :: Internet :: WWW/HTTP",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.27",
+    "httpx>=0.25",
+    "typer>=0.9",
+    "PyYAML>=6.0",
+    "python-daemon>=3.0",
+    "lockfile>=0.12",
+]
+
+[project.urls]
+Homepage = "https://github.com/joshtheflash/cpee-mock"
+Repository = "https://github.com/joshtheflash/cpee-mock"
+
+[project.scripts]
+cpee-db-cli = "app.db.dbCli:app"
+cpee-replay-daemon = "run_replay_daemon:main"
+server = "server:app"
+
+[tool.setuptools.packages.find]
+include = ["app*"]
+
+[tool.setuptools]
+py-modules = ["run_replay_daemon"]

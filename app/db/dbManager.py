@@ -8,13 +8,24 @@ Includes connection handling and persistent key–value settings storage.
 import sqlite3
 import os
 import json
+from pathlib import Path
+
 from app import loadLogs as logLoader
 
-BASE_DIR = os.path.dirname(__file__)
-DB_DIR = os.path.join(BASE_DIR)   # directory for databases
-DEFAULT_DB = os.path.join(DB_DIR, "events.db")
-DB_PATH = DEFAULT_DB
-CONFIG_FILE = os.path.join(BASE_DIR, "_config.json")
+APP_HOME = Path(os.environ.get("CPEE_REPLAY_HOME", Path.home() / ".cpee_multi_replay")).expanduser()
+DB_DIR = APP_HOME / "db"
+CONFIG_FILE = APP_HOME / "_config.json"
+DEFAULT_DB = DB_DIR / "events.db"
+DB_PATH = str(DEFAULT_DB)
+
+
+def _ensure_storage_dirs() -> None:
+    """Create runtime directories for config and database files."""
+    DB_DIR.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+
+_ensure_storage_dirs()
 
 # Default schema for replay event tables
 DEFAULT_TABLE_SCHEMA = '''
@@ -32,19 +43,17 @@ CREATE TABLE IF NOT EXISTS {table_name} (
 
 def _read_config() -> dict:
     """Load global DB config from disk."""
-    if os.path.exists(CONFIG_FILE):
+    if CONFIG_FILE.exists():
         try:
-            with open(CONFIG_FILE, "r") as f:
-                return json.load(f)
+            return json.loads(CONFIG_FILE.read_text())
         except Exception:
             pass
     return {}
 
 def _write_config(data: dict) -> None:
     """Save global DB config to disk."""
-    os.makedirs(os.path.dirname(CONFIG_FILE), exist_ok=True)
-    with open(CONFIG_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+    CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    CONFIG_FILE.write_text(json.dumps(data, indent=2))
 
 def set_active_db(path: str) -> None:
     """Persistently mark the given path as the active database."""
@@ -56,26 +65,30 @@ def get_active_db() -> str:
     """Return the active DB path (falls back to default)."""
     cfg = _read_config()
     path = cfg.get("active_db_path")
-    return path
+    if path:
+        return path
+
+    default_path = str(DEFAULT_DB)
+    set_active_db(default_path)
+    return default_path
 
 
 def setup(db_name: str = "events.db") -> str:
     global DB_PATH
 
-    # Ensure directory exists
-    os.makedirs(DB_DIR, exist_ok=True)
+    DB_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Avoid double .db
-    if not db_name.endswith(".db"):
-        db_name += ".db"
-    db_path = os.path.join(DB_DIR, db_name)
+    db_name = f"{db_name}.db" if not db_name.endswith(".db") else db_name
+    db_path = Path(db_name)
+    if not db_path.is_absolute():
+        db_path = DB_DIR / db_path.name
+    db_path = db_path.resolve()
 
-    # Update global path and persist in config
-    DB_PATH = db_path
-    set_active_db(db_path)
+    DB_PATH = str(db_path)
+    set_active_db(DB_PATH)
 
     # Create _settings table
-    conn = sqlite3.connect(db_path)
+    conn = sqlite3.connect(DB_PATH)
     conn.execute("""
         CREATE TABLE IF NOT EXISTS _settings (
             key TEXT PRIMARY KEY,
@@ -100,6 +113,7 @@ def get_connection() -> sqlite3.Connection:
     Open a SQLite connection with predefined pragmas for reliability and performance.
     """
     db_path = get_active_db()
+    os.makedirs(os.path.dirname(db_path), exist_ok=True)
     conn = sqlite3.connect(db_path, timeout=2, isolation_level=None)
     conn.execute("PRAGMA busy_timeout = 2000")
     conn.execute("PRAGMA journal_mode = WAL")
@@ -129,7 +143,8 @@ def set_db_path(path: str) -> None:
     Update the global database path to a new SQLite file.
     """
     global DB_PATH
-    DB_PATH = path
+    DB_PATH = os.path.abspath(path)
+    set_active_db(DB_PATH)
 
 def get_setting(key: str) -> str | None:
     """
@@ -259,13 +274,9 @@ def get_matching_call(endpoint: str, params: dict, table_name: str):
     """Find a matching call in the database for given endpoint + parameters."""
     conn = get_connection()
     try:
-        # Normalize incoming parameter values (JSON, whitespace, etc.)
         norm_params = {k: normalize_value(v) for k, v in params.items()}
-
         query = f"SELECT * FROM {quote_ident(table_name)} WHERE endpoint_name = ?"
         values = [endpoint]
-
-        # Compare normalized text (spaces removed) and treat NULL == ''
         for k, v in norm_params.items():
             query += (
                 f" AND REPLACE(COALESCE(CAST(json_extract(input_params_json, '$.{k}') AS TEXT), ''), ' ', '') = "
