@@ -36,8 +36,6 @@ cpee-db-cli = "app.db.dbCli:app"
 cpee-replay-daemon = "run_replay_daemon:main"
 server = "server:app"
 
-[tool.setuptools.packages.find]
-include = ["app*"]
-
 [tool.setuptools]
-py-modules = ["run_replay_daemon"]
+packages = { find = { include = ["app*"] } }
+py-modules = ["run_replay_daemon", "server"]
