@@ -28,8 +28,8 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/joshtheflash/cpee-mock"
-Repository = "https://github.com/joshtheflash/cpee-mock"
+Homepage = "https://github.com/joshtheflash/cpee-multi-replayer"
+Repository = "https://github.com/joshtheflash/cpee-multi-replayer"
 
 [project.scripts]
 cpee-db-cli = "app.db.dbCli:app"
