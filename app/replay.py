@@ -1,169 +1,301 @@
-from distutils.command import config
-from fastapi import FastAPI, Header, Body, Query, Request, Form, BackgroundTasks
-from fastapi.responses import Response
-from typing import Dict, Any, List, Optional
+"""
+replay.py
+----------
+FastAPI-based replay service for the CPEE environment.
+Replays recorded endpoint responses based on process logs.
+"""
+from fastapi import FastAPI, Request, Header, Query, Response
+from typing import Dict, Any, List, Optional, Union
+from datetime import datetime
+from time import perf_counter
 import asyncio
 import httpx
-from datetime import datetime
-import sqlite3
 import json
-import db.db_cli as dbcli
-import db.dbManager as dbm
-import scripts.loadLogs as loader
+import base64
+import re
+import logging
+from contextlib import asynccontextmanager
 
-async def send_back(cpee_callback: str, sendback,start,is_last):
-    headers: Dict[str, str] = {}
-    try:
-        async with httpx.AsyncClient() as client:
-                if not is_last:
-                    headers["CPEE-UPDATE"] = "true"
-                    
-                if isinstance(sendback.get('data'), list) and sendback.get('data'):
-                    first_item = sendback.get('data', [{}])[0]
-                    key = 'value' if 'value' in first_item else 'data'
-                    data = {item['name']: item[key] for item in sendback.get('data', [])}
-                else:
-                    print('Warning: Empty data received')
-                    data = {}
-                    
-                ts = datetime.fromisoformat(sendback.get('timestamp'))
-                dur = ts - start
-                
-                try:
-                    if sendback.get('lifecycle') == 'activity/receiving':
-                        print(f"Replaying response after {dur.total_seconds()}s delay")
-                        await asyncio.sleep(dur.total_seconds()) 
-                        print(f"Sending response to {cpee_callback} with headers: {headers}")
-                        res = await client.put(cpee_callback, data=data, headers=headers)
-                        print(f"Response sent: {res.status_code}")
-                except httpx.TimeoutException:
-                    print(f"Timeout: Callback server at {cpee_callback} did not respond")
-                except httpx.ConnectError as e:
-                    print(f"Connection error: Could not connect to {cpee_callback}")
-                except Exception as e:
-                    print(f"HTTP request error: {e}")
-    except Exception as e:
-        print(f"Error in send_back: {e}")
+from app.db import dbManager as dbm
 
+# --------------------------------------------------------
+# Configuration
+# --------------------------------------------------------
 
-def get_call(form: Dict[str, Any], db, oep, table_name: str) -> Optional[tuple]:
-    print(f"Searching for: {oep} with params: {form}")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s - %(message)s"
+)
+logger = logging.getLogger(__name__)
 
-    query = f"SELECT * FROM {dbcli.quote_ident(table_name)} WHERE endpoint_name = ?"
-    params_list = [oep]
+BASE64_URI_PATTERN = re.compile(r"data:[^,]+,([A-Za-z0-9+/=\n\r]+)")
 
-    # Add json_extract conditions for each key in params
-    # - Compare type-insensitively
-    # - Treat NULL in DB as equivalent to empty string from the form
-    # - For JSON-like strings such as 'init', ignore whitespace differences
-    for key, value in form.items():
-        if key == 'init' and isinstance(value, str):
-            query += (
-                " AND REPLACE(CAST(json_extract(input_params_json, '$.init') AS TEXT), ' ', '') = "
-                "REPLACE(CAST(? AS TEXT), ' ', '')"
-            )
-            params_list.append(value)
-        else:
-            query += (
-                f" AND COALESCE(CAST(json_extract(input_params_json, '$.{key}') AS TEXT), '') = "
-                f"COALESCE(CAST(? AS TEXT), '')"
-            )
-            params_list.append(value)
+http_client: Optional[httpx.AsyncClient] = None
 
-    query += " ORDER BY RANDOM() LIMIT 1"
+# --------------------------------------------------------
+# Parsing Utilities
+# --------------------------------------------------------
 
-    event = db.execute(query, params_list).fetchone()
-    if event:
-        print(f"Found matching call: ID {event[0]}")
-        return event
-    else:
-        print("No matching call found")
-        return None
-
-def get_instantiation(call: Dict[str, Any], db, table_name: str) -> Optional[tuple]:
-    instance_uuid = call[0]
-    activity_uuid = call[1]
-    query = f"SELECT * FROM {dbcli.quote_ident(table_name)} WHERE instance_uuid = ? AND activity_uuid = ? AND event_type = 'instantiation'"
-    params = (instance_uuid, activity_uuid)
-    return db.execute(query, params).fetchone()
-
-
-def extract_form_params(form_data) -> Dict[str, Any]:
-    """Extract and convert parameters from form data"""
+def parse_header_params(header: Optional[str]) -> Dict[str, str]:
+    """Parse space-separated key=value pairs from header."""
+    if not header:
+        return {}
+    
     params = {}
-    for key, value in form_data.items():
-        if isinstance(value, str):
-            # Try integer conversion
-            if value.isdigit():
-                params[key] = int(value)
-            # Try float conversion  
-            elif value.replace('.', '', 1).isdigit():
-                params[key] = float(value)
-            else:
-                params[key] = value
-        else:
-            params[key] = value
+    for token in header.split():
+        if "=" in token:
+            key, value = token.split("=", 1)
+            params[key.strip()] = value.strip()
     return params
 
-async def send_back_all(cpee_callback: str, responses: List[Dict[str, Any]], start: datetime):
-    for i, response in enumerate(responses):
-            is_last = (i == len(responses) - 1)
-            await send_back(cpee_callback, response, start, is_last)
+def parse_form_value(value: str) -> Any:
+    """Convert form string to appropriate type (int/float/str)."""
+    if not isinstance(value, str):
+        return value
+    
+    if value.isdigit():
+        return int(value)
+    
+    try:
+        if "." in value:
+            return float(value)
+    except ValueError:
+        pass
+    
+    return value
 
-app = FastAPI()
+def extract_form_data(form_data) -> Dict[str, Any]:
+    """Extract and type-convert form data."""
+    return {key: parse_form_value(value) for key, value in form_data.items()}
 
-@app.api_route("/cpee/replay", methods=["POST", "PUT", "GET", "DELETE", "PATCH"])
-async def DoIt(
+# --------------------------------------------------------
+# Response Processing
+# --------------------------------------------------------
+
+def structure_response_data(response: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    """Convert response data list to name-keyed dictionary."""
+    data_list = response.get("data", [])
+    if not isinstance(data_list, list):
+        return {}
+    
+    return {
+        item["name"]: {k: v for k, v in item.items() if k != "name"}
+        for item in data_list
+        if "name" in item
+    }
+
+def decode_content(content: Any) -> bytes:
+    """Decode content to bytes, handling base64 data URIs and text."""
+    if isinstance(content, (bytes, bytearray)):
+        return bytes(content)
+    
+    if isinstance(content, str):
+        content = content.strip()
+        
+        # Try base64 data URI
+        match = BASE64_URI_PATTERN.match(content)
+        if match:
+            try:
+                return base64.b64decode(match.group(1))
+            except Exception:
+                pass
+        
+        return content.encode("utf-8", errors="replace")
+    
+    return str(content).encode("utf-8", errors="replace")
+
+def build_multipart_payload(structured_data: Dict[str, Dict[str, Any]]) -> List[tuple]:
+    """Build multipart file payload for httpx."""
+    files = []
+    for name, entry in structured_data.items():
+        mimetype = entry.get("mimetype", "text/plain")
+        content = decode_content(entry.get("data"))
+        files.append((name, ("", content, mimetype)))
+    return files
+
+# --------------------------------------------------------
+# Response Replay Logic
+# --------------------------------------------------------
+
+async def send_callback(callback_url: str, payload: Dict[str, Any], is_final: bool) -> None:
+    """Send a recorded response payload to the callback URL."""
+    files = build_multipart_payload(structure_response_data(payload))
+    headers = {} if is_final else {"CPEE-UPDATE": "true"}
+
+    try:
+        client = http_client
+        if client is None:
+            async with httpx.AsyncClient() as temp_client:
+                await temp_client.put(callback_url, files=files, headers=headers)
+        else:
+            await client.put(callback_url, files=files, headers=headers)
+    except Exception:
+        logger.exception("Failed to send callback to %s", callback_url)
+
+async def replay_responses(
+    callback_url: str,
+    responses: List[Dict[str, Any]],
+    start_time: datetime
+) -> None:
+    """Replay all responses with correct timing."""
+    if not responses:
+        return
+
+    base_ts = min(
+        start_time,
+        *(datetime.fromisoformat(responses[0]["timestamp"]) for _ in [0]),
+    )
+    replay_started = perf_counter()
+
+    for index, response in enumerate(responses):
+        try:
+            target_ts = datetime.fromisoformat(response["timestamp"])
+        except Exception:
+            continue
+
+        delay = max((target_ts - base_ts).total_seconds(), 0)
+        remaining = delay - (perf_counter() - replay_started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        await send_callback(callback_url, response, is_final=(index == len(responses) - 1))
+
+
+async def replay_delays_only(
+    responses: List[Dict[str, Any]],
+    start_time: Union[datetime, str],
+    context: str
+) -> None:
+    """Wait using recorded response timings without sending data."""
+    if not responses:
+        return
+
+    if isinstance(start_time, datetime):
+        base_ts = start_time
+    else:
+        try:
+            base_ts = datetime.fromisoformat(start_time)
+        except Exception:
+            base_ts = datetime.utcnow()
+
+    try:
+        first_ts = datetime.fromisoformat(responses[0]["timestamp"])
+        if first_ts < base_ts:
+            base_ts = first_ts
+    except Exception:
+        pass
+
+    replay_started = perf_counter()
+
+    for response in responses:
+        timestamp_raw = response.get("timestamp")
+        if not timestamp_raw:
+            continue
+        try:
+            target_ts = datetime.fromisoformat(timestamp_raw)
+        except Exception:
+            continue
+
+        delay = max((target_ts - base_ts).total_seconds(), 0)
+        remaining = delay - (perf_counter() - replay_started)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+    
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global http_client
+    if http_client is None:
+        limits = httpx.Limits(max_connections=20, max_keepalive_connections=10)
+        http_client = httpx.AsyncClient(limits=limits, timeout=httpx.Timeout(20.0))
+        logger.debug("Initialised shared HTTP client for replay callbacks")
+    yield
+    if http_client is not None:
+        await http_client.aclose()
+        http_client = None
+        logger.debug("Closed shared HTTP client")
+
+app = FastAPI(title="CPEE Replay System", lifespan=lifespan)
+
+@app.api_route("/cpee/replay", methods=["POST", "PUT", "GET"])
+async def replay_endpoint(
     request: Request,
     oep: str = Query(..., alias="original_endpoint"),
     cpee_callback: Optional[str] = Header(None, alias="cpee-callback"),
-    sim_target: Optional[str] = Header(None, alias="cpee-sim-target")
+    sim_target: Optional[str] = Header(None, alias="cpee-sim-target"),
+    sim_engine: Optional[str] = Header(None, alias="cpee-attr-sim-engine"),
+    sim_translate: Optional[str] = Header(None, alias="cpee-attr-sim-translate")
 ):
+    """Handle replay requests from CPEE."""
     try:
-        last_sim_target = dbm.get_setting('last_sim_target') or ""
-        parts = dict(pair.split("=", 1) for pair in sim_target.split())
-        table_name = parts.get("table")
-        if table_name:
-            dbcli.create_table(table_name)
-            dbm.set_setting('active_table', table_name)
-
-        table_name = table_name or dbm.get_setting('active_table') or 'calls'
-        print(f"Using table: {table_name}")
-        last_sim_target = sim_target
-        dbm.set_setting('last_sim_target', last_sim_target)
-
-        form_data = await request.form()
-        form = extract_form_params(form_data)
+        # Determine active table
+        target_params = parse_header_params(sim_target)
+        table_name = target_params.get("table") or dbm.get_setting("active_table") or "calls"
         
-        db = sqlite3.connect('../db/events.db')
-        call = get_call(form, db, oep, table_name)
-        if call:
-            instantiation = get_instantiation(call, db, table_name)
-            if call[6] == "call":
-                responses = json.loads(call[5])
-                start = datetime.fromisoformat(call[3])               
-                if instantiation is not None:
-                    headers = {"CPEE-SIM-TASKTYPE": "i"}
-                    sim_engine = request.headers.get("cpee-attr-sim-engine")
-                    sim_translate = request.headers.get("cpee-attr-sim-translate")
-                    if sim_engine is not None:
-                        headers["CPEE-SIM-ENGINE"] = str(sim_engine)
-                    if sim_translate is not None:
-                        headers["CPEE-SIM-TRANSLATE"] = str(sim_translate)
-                    headers["CPEE-SIM-MODEL"] = "https://cpee.org/hub/server/Templates.dir/Wait.xml"
-                    headers["CPEE-SIM-TARGET"] = str(sim_target)
-                    headers["CPEE-CALLBACK"] = "true"
-                    print("Headers: ",headers)
-                    res = Response(status_code=561, headers=headers)
-                    print("Returning 561 with headers: ", headers)
-                else:
-                    if cpee_callback:
-                        asyncio.create_task(send_back_all(cpee_callback, responses, start))
-                    res = Response(status_code=200, headers={"CPEE-CALLBACK": "true"})
-                return res
-        else:
+        if target_params.get("table"):
+            if not dbm.table_exists(table_name):
+                logger.error(f"Specified table does not exist: {table_name}")
+                return Response(status_code=400, content=f"Table '{table_name}' does not exist.")
+            dbm.set_setting("active_table", table_name)
+        
+        logger.debug(f"Using table: {table_name}")
+        
+        # Parse request form data
+        form = extract_form_data(await request.form())
+        logger.debug(f"Replay request: endpoint={oep}, form={form}")
+        
+        # Find matching call
+        call = dbm.get_matching_call(oep, form, table_name)
+        if not call:
+            logger.debug("No matching call found; attempting endpoint-only replay")
+            fallback_call = dbm.get_call_by_endpoint(oep, table_name)
+            if fallback_call:
+                responses_json = fallback_call[5] or "[]"
+                try:
+                    responses = json.loads(responses_json)
+                except Exception:
+                    logger.exception("Failed to parse responses for fallback call; using empty list")
+                    responses = []
+                if not isinstance(responses, list):
+                    logger.debug("Fallback responses payload is not a list; ignoring contents")
+                    responses = []
+
+                await replay_delays_only(responses, fallback_call[3], context="endpoint-fallback")
+            else:
+                logger.debug("No recorded calls available for endpoint fallback")
             return Response(status_code=200, headers={"CPEE-CALLBACK": "false"})
-            
+        
+        # Handle instantiation task
+        if call[6] == "instantiation":
+            headers = {
+                "CPEE-SIM-ENGINE": sim_engine,
+                "CPEE-SIM-TRANSLATE": sim_translate,
+                "CPEE-SIM-TASKTYPE": "i",
+                "CPEE-SIM-MODEL": form.get("url", ""),
+                "CPEE-SIM-TARGET": sim_target or ""
+            }
+            logger.debug(f"Returning instantiation response (561) with headers: {headers}")
+            return Response(status_code=561, headers=headers)
+        
+        # Schedule normal response replay
+        responses = json.loads(call[5])
+        start_time = datetime.fromisoformat(call[3])
+        
+        logger.debug(f"Found {len(responses)} responses starting at {start_time}")
+        
+        if cpee_callback:
+            asyncio.create_task(replay_responses(cpee_callback, responses, start_time))
+            logger.debug(
+                "Started asynchronous replay task for callback %s (responses=%d, start=%s)",
+                cpee_callback,
+                len(responses),
+                start_time.isoformat(),
+            )
+        else:
+            logger.warning("No callback URL provided")
+        
+        return Response(status_code=200, headers={"CPEE-CALLBACK": "true"})
+        
     except Exception as e:
-        print(f"Error in DoIt: {e}")
-        return {"error": "Internal server error"}
+        logger.exception("Replay error")
+        return {"error": str(e)}

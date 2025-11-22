@@ -1,152 +1,186 @@
+"""
+loadLogs.py
+------------
+Parses XES-YAML process logs exported from the CPEE engine and loads
+them into the SQLite database used by the replay system.
+Each call, response, and instantiation event is stored as a row
+in the selected table.
+"""
+
 import os
-import sqlite3
-import yaml
 import json
+import yaml
+import sqlite3
 from glob import glob
-import cProfile
-import pstats
-import db.dbManager as dbm
+from app.db import dbManager
 
-DB_PATH = os.path.join(os.path.dirname(__file__), '../db/events.db')
-LOGS_DIR = os.path.join(os.path.dirname(__file__), '../logs/coopis2010')
+# Default paths (can be overridden by CLI arguments)
+DEFAULT_LOG_DIR = os.path.join(os.path.dirname(__file__), "../logs/coopis2010")
 
-def _open_connection():
-    conn = sqlite3.connect(DB_PATH, timeout=2, check_same_thread=False, isolation_level=None)
+
+# --------------------------------------------------------
+# Database helpers
+# --------------------------------------------------------
+
+def _ensure_table(c: sqlite3.Cursor, table_name: str):
+    dbManager.create_table(table_name)
+    
+
+
+def _insert_records(c: sqlite3.Cursor, records: list, table_name: str):
+    """Insert collected records into the database."""
+    if not records:
+        return
+    qtable = f'"{table_name}"'
+    sql = f"""
+        INSERT OR IGNORE INTO {qtable} (
+            instance_uuid, endpoint_name, call_timestamp,
+            input_params_json, activity_uuid, responses_json, event_type
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    """
+    c.executemany(sql, records)
+
+
+# --------------------------------------------------------
+# Log parsing logic
+# --------------------------------------------------------
+
+def _parse_event(doc):
+    """Extract relevant fields from a single YAML event document."""
+    if not isinstance(doc, dict) or "event" not in doc:
+        return None
+
+    event = doc["event"]
+    return {
+        "instance_uuid": event.get("cpee:instance"),
+        "activity_uuid": event.get("cpee:activity_uuid"),
+        "endpoint_name": event.get("concept:endpoint"),
+        "timestamp": event.get("time:timestamp"),
+        "lifecycle": event.get("cpee:lifecycle:transition"),
+        "data": event.get("data") or event.get("raw") or []
+    }
+
+
+def _process_log_file(file_path: str, all_records: list):
+    """Read one YAML log file and extract database records."""
+    with open(file_path, "r") as f:
+        docs_iter = yaml.load_all(f, Loader=yaml.CSafeLoader)
+
+        # Skip metadata document
+        next(docs_iter, None)
+
+        current_calls = {}
+
+        for doc in docs_iter:
+            parsed = _parse_event(doc)
+            if not parsed:
+                continue
+
+            inst_uuid = parsed["instance_uuid"]
+            act_uuid = parsed["activity_uuid"]
+            endpoint = parsed["endpoint_name"]
+            timestamp = parsed["timestamp"]
+            lifecycle = parsed["lifecycle"]
+            data = parsed["data"]
+
+            # Handle different event types
+            if lifecycle == "activity/calling":
+                input_params = {
+                    d["name"]: d.get("value") for d in data
+                    if isinstance(d, dict) and "name" in d
+                }
+                current_calls[(inst_uuid, act_uuid)] = {
+                    "instance_uuid": inst_uuid,
+                    "endpoint_name": endpoint,
+                    "call_timestamp": timestamp,
+                    "input_params_json": json.dumps(input_params),
+                    "activity_uuid": act_uuid,
+                    "responses": []
+                }
+
+            elif lifecycle in ["activity/receiving", "task/instantiation", "activity/done"]:
+                key = (inst_uuid, act_uuid)
+                if lifecycle == "activity/receiving":
+                    # Ensure the call exists or create a placeholder
+                    if key not in current_calls:
+                        current_calls[key] = {
+                            "instance_uuid": inst_uuid,
+                            "endpoint_name": endpoint,
+                            "call_timestamp": timestamp,
+                            "input_params_json": "{}",
+                            "activity_uuid": act_uuid,
+                            "responses": []
+                        }
+                    current_calls[key]["responses"].append({
+                        "timestamp": timestamp,
+                        "lifecycle": lifecycle,
+                        "data": data,
+                    })
+
+                elif lifecycle == "task/instantiation":
+                    if key in current_calls:
+                        current_calls[key]["instantiation"] = "true"
+
+                elif lifecycle == "activity/done":
+                    call = current_calls.pop(key, None)
+                    if not call:
+                        continue  # skip if nothing to finalize
+                    event_type = "instantiation" if "instantiation" in call else "call"
+                    all_records.append((
+                        call["instance_uuid"],
+                        call["endpoint_name"],
+                        call["call_timestamp"],
+                        call["input_params_json"],
+                        call["activity_uuid"],
+                        json.dumps(call["responses"]),
+                        event_type
+                    ))
+
+
+
+# --------------------------------------------------------
+# Main ingestion routine
+# --------------------------------------------------------
+
+def _ingest_logs(logs_dir: str, table_name: str, clear_first: bool = False, chunk_size: int = 10000):
+    """Read all logs from directory and insert into SQLite."""
+    logs_dir = logs_dir or DEFAULT_LOG_DIR
+    conn = dbManager.get_connection()
     c = conn.cursor()
-    c.execute('PRAGMA busy_timeout = 2000')
-    c.execute('PRAGMA journal_mode = WAL')
-    c.execute('PRAGMA synchronous = OFF')  # Faster writes
-    c.execute('PRAGMA cache_size = -64000')   # 64MB cache
-    return conn, c
 
-def _quote_ident(name):
-    return '"' + str(name).replace('"', '""') + '"'
-
-def _ensure_table(c, table_name):
-    qtable = _quote_ident(table_name)
-    c.execute(f'''
-CREATE TABLE IF NOT EXISTS {qtable} (
-    instance_uuid TEXT,
-    activity_uuid TEXT,
-    endpoint_name TEXT,
-    call_timestamp TEXT,
-    input_params_json JSON,
-    responses_json TEXT,
-    event_type TEXT,
-    PRIMARY KEY (instance_uuid, activity_uuid, event_type)
-)
-''')
-
-def _ingest_logs(clear_first=False, logs_dir=None, table_name='calls', chunk_size=10000):
-    conn, c = _open_connection()
     _ensure_table(c, table_name)
-    dbm.set_setting('last_loaded_directory', logs_dir or LOGS_DIR)
+    dbManager.set_setting("last_loaded_directory", logs_dir)
+
     if clear_first:
-        qtable = _quote_ident(table_name)
-        c.execute(f'DROP TABLE IF EXISTS {qtable}')
+        c.execute(f"DROP TABLE IF EXISTS '{table_name}'")
         _ensure_table(c, table_name)
 
-    target_logs_dir = logs_dir or LOGS_DIR
-    qtable = _quote_ident(table_name)
-    
-    insert_sql = f'''
-        INSERT OR IGNORE INTO {qtable} (
-            instance_uuid, endpoint_name, call_timestamp, input_params_json, 
-            activity_uuid, responses_json, event_type
-        ) VALUES (?, ?, ?, ?, ?, ?, ?)
-    '''
-    
     all_records = []
-    c.execute('BEGIN')
 
-    for log_file in glob(os.path.join(target_logs_dir, '*.xes.yaml')):
-        with open(log_file, 'r') as f:
-            docs_iter = yaml.load_all(f,Loader=yaml.CSafeLoader)
-            current_calls = {}
+    for log_file in glob(os.path.join(logs_dir, "*.xes.yaml")):
+        _process_log_file(log_file, all_records)
 
-            # Skip metadata
-            next(docs_iter, None)
+        # Insert in chunks to save memory
+        if len(all_records) >= chunk_size:
+            _insert_records(c, all_records, table_name)
+            all_records.clear()
 
-            for doc in docs_iter:
-                if not isinstance(doc, dict) or 'event' not in doc:
-                    continue 
-
-                event = doc['event']
-                instance_uuid = event.get('cpee:instance')
-                activity_uuid = event.get('cpee:activity_uuid')
-                endpoint_name = event.get('concept:endpoint')
-                timestamp = event.get('time:timestamp')
-                lifecycle = event.get('cpee:lifecycle:transition')
-                data = event.get('data') or event.get('raw') or []
-
-                if lifecycle == 'activity/calling':
-                    input_params = {d['name']: d['value'] for d in data 
-                                    if isinstance(d, dict) and 'name' in d and 'value' in d}
-                    current_calls[(instance_uuid, activity_uuid)] = {
-                        'instance_uuid': instance_uuid,
-                        'endpoint_name': endpoint_name,
-                        'call_timestamp': timestamp,
-                        'input_params_json': json.dumps(input_params, sort_keys=False),
-                        'activity_uuid': activity_uuid,
-                        'responses': []
-                    }
-                elif lifecycle == 'task/instantiation':
-                    input_params = {d['name']: d['value'] for d in data 
-                                    if isinstance(d, dict) and 'name' in d and 'value' in d}
-                    all_records.append((
-                        instance_uuid, endpoint_name, timestamp,
-                        json.dumps(input_params, sort_keys=False),
-                        activity_uuid, None, 'instantiation'
-                    ))
-                elif activity_uuid and lifecycle in ['activity/receiving', 'task/instantiation', 'activity/done']:
-                    call_key = (instance_uuid, activity_uuid)
-                    if call_key in current_calls:
-                        if lifecycle in ['activity/receiving', 'task/instantiation']:
-                            current_calls[call_key]['responses'].append({
-                                'timestamp': timestamp, 'lifecycle': lifecycle, 'data': data
-                            })
-                        elif lifecycle == 'activity/done':
-                            call = current_calls.pop(call_key)
-                            all_records.append((
-                                call['instance_uuid'], call['endpoint_name'],
-                                call['call_timestamp'], call['input_params_json'],
-                                call['activity_uuid'],
-                                json.dumps(call['responses'], sort_keys=False), 'call'
-                            ))
-
-                if len(all_records) >= chunk_size:
-                    c.executemany(insert_sql, all_records)
-                    all_records.clear()
-
-    # Reste einfügen
-    if all_records:
-        c.executemany(insert_sql, all_records)
-    
-    c.execute('COMMIT')
-    # Indexe nach allen Inserts
-    idx_prefix = f'idx_{table_name}'
-    c.execute(f'CREATE INDEX IF NOT EXISTS {idx_prefix}_endpoint_name ON {qtable} (endpoint_name)')
-    c.execute(f'CREATE INDEX IF NOT EXISTS {idx_prefix}_input_params ON {qtable} (input_params_json)')
-    c.execute(f'CREATE INDEX IF NOT EXISTS {idx_prefix}_event_type ON {qtable} (event_type)')
+    # Insert remaining records
+    _insert_records(c, all_records, table_name)
     conn.commit()
     conn.close()
 
-def parse_logs(logs_dir='../../../logs/turmv4_batch6', table_name='calls'):
-    try:
-        print(f'Parsing logs from {logs_dir}')
-        _ingest_logs(clear_first=True, logs_dir=logs_dir, table_name=table_name)
-    except sqlite3.OperationalError as e:
-        print(f'SQLite error during parse_logs: {e}', flush=True)
-        raise
 
-def append_logs(logs_dir=None, table_name='calls'):
-    try:
-        _ingest_logs(clear_first=False, logs_dir=logs_dir, table_name=table_name)
-    except sqlite3.OperationalError as e:
-        print(f'SQLite error during append_logs: {e}', flush=True)
-        raise
+# --------------------------------------------------------
+# Public interface
+# --------------------------------------------------------
 
-if __name__ == "__main__":
-    cProfile.run('parse_logs()','parse_logs.prof', sort='cumulative')
-    pstats.Stats('parse_logs.prof').sort_stats('cumulative').print_stats()
-    #parse_logs()
+def parse_logs(logs_dir: str = DEFAULT_LOG_DIR, table_name: str = "calls"):
+    """Parse logs and replace existing table contents."""
+    _ingest_logs(logs_dir, table_name, clear_first=True)
+
+
+def append_logs(logs_dir: str = DEFAULT_LOG_DIR, table_name: str = "calls"):
+    """Append logs without removing existing data."""
+    _ingest_logs(logs_dir, table_name, clear_first=False)
