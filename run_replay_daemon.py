@@ -108,6 +108,13 @@ def main() -> None:
     }
     context.files_preserve = [stdout_handle.fileno(), stderr_handle.fileno()]
 
+    print(
+        "[cpee-replay-daemon] Starting daemon in background "
+        f"(host={host} port={port}). PID file: {pid_path}. "
+        f"Logs -> stdout: {stdout_path}, stderr: {stderr_path}",
+        flush=True,
+    )
+
     try:
         with context:
             logging.basicConfig(

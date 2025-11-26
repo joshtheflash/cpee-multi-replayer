@@ -32,7 +32,7 @@ Homepage = "https://github.com/joshtheflash/cpee-multi-replayer"
 Repository = "https://github.com/joshtheflash/cpee-multi-replayer"
 
 [project.scripts]
-cpee-db-cli = "app.db.dbCli:app"
+cpee-replay-cli = "app.db.dbCli:app"
 cpee-replay-daemon = "run_replay_daemon:main"
 server = "server:app"
 

@@ -167,6 +167,20 @@ def clear_settings() -> None:
         conn.execute("DROP TABLE IF EXISTS _settings")
         conn.commit()
 
+
+def show_config() -> dict:
+    """Return current runtime configuration details for inspection."""
+    cfg = _read_config()
+    active_db = cfg.get("active_db_path") or str(DEFAULT_DB)
+    db_path = Path(active_db)
+    return {
+        "app_home": str(APP_HOME),
+        "config_file": str(CONFIG_FILE),
+        "config_exists": CONFIG_FILE.exists(),
+        "active_db_path": str(db_path),
+        "database_exists": db_path.exists(),
+    }
+
 def table_exists(table_name: str) -> bool:
     """Check if a table exists in the database."""
     with get_connection() as conn:
